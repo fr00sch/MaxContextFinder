@@ -31,11 +31,16 @@ This tool tests increasing context sizes with your chosen Ollama model to find t
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/scionero/maxcontextfinder
+git clone https://github.com/fr00sch/maxcontextfinder
 cd maxcontextfinder
 ```
 
-2. Install required Python packages:
+2. Create virtual envirement
+```bash
+python3 -m  -m  venv ./.venv      
+```
+
+3. Install required Python packages:
 ```bash
 pip install -r requirements.txt
 ```
@@ -49,7 +54,7 @@ python main.py MODEL_NAME
 
 Example:
 ```bash
-python main.py codellama:latest
+python main.py qwen3:8b
 ```
 
 ### Command Line Options
@@ -62,7 +67,7 @@ python main.py codellama:latest
 
 Example with all options:
 ```bash
-python main.py mistral:7b --min_token_rate 15 --start 2048 --step 2048 --tests 5
+python main.py qwen3:8b --min_token_rate 15 --start 2048 --step 2048 --tests 5
 ```
 
 ### Output

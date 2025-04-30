@@ -1,2 +1,4 @@
-ollama==0.4.7
-timeout-decorator==0.5.0
+ollama
+timeout-decorator
+dotenv
+flask

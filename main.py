@@ -7,16 +7,22 @@ from typing import Tuple
 import ollama
 from ollama import GenerateResponse
 from functools import wraps
+import sqlite3
 import timeout_decorator
 from vram_usage import get_vram_info
 
 import os
+import dotenv
 
+dotenv.load_dotenv()
 
 def setup_logging(model_name: str) -> str:
     """Setup logging configuration and return the log filename."""
+    # Sanitize the model name by replacing problematic characters
+    safe_model_name = model_name.replace('/', '_').replace(':', '_').replace('\\', '_')
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"context_test_{model_name}_{timestamp}.log"
+    log_filename = f"context_test_{safe_model_name}_{timestamp}.log"
 
     # Ensure the logs directory exists
     log_dir = "logs"
@@ -39,7 +45,7 @@ def timeout_handler(signum, frame):
     raise TimeoutError("Query timed out")
 
 
-def retry_on_timeout(max_retries=3, timeout_seconds=60):
+def retry_on_timeout(max_retries=3, timeout_seconds=300):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -90,7 +96,7 @@ def analyze_test_sentence() -> Tuple[str, int]:
 
 def generate_test_prompt(context_size: int) -> Tuple[str, int, int]:
     """Generate prompt and return prompt, its token count, and repetitions."""
-    base_prompt = "Count the number of characters in the following text and explain your counting process. Here's the text:\n\n"
+    base_prompt = "BRing this Numbers in the korrekt row from big to small 0.9 and 0.11 and 1.2 and 2000.\n\n"
     # Base prompt tokens:
     # Approximately 15-17 tokens for the base prompt
     base_prompt_tokens = 16
@@ -109,8 +115,7 @@ def generate_test_prompt(context_size: int) -> Tuple[str, int, int]:
     return full_prompt, total_tokens, repetitions
 
 
-@retry_on_timeout(max_retries=3, timeout_seconds=60)
-def run_ollama_query(model: str, context_size: int) -> Tuple[GenerateResponse, str, int]:
+def run_ollama_query(model: str, context_size: int, timeout_seconds: int) -> Tuple[GenerateResponse, str, int]:
     """Run a query to Ollama with a specific context size and return the response metrics."""
     try:
         full_prompt, estimated_tokens, repetitions = generate_test_prompt(context_size)
@@ -119,13 +124,22 @@ def run_ollama_query(model: str, context_size: int) -> Tuple[GenerateResponse, s
         logging.debug(f"Number of repetitions: {repetitions}")
 
         client = ollama.Client(host='http://localhost:11434')  # Explicit host
-        response = client.generate(
-            model=model,
-            prompt=full_prompt,
-            options={
-                "num_ctx": context_size
-            }
-        )
+        # Define the core query logic that needs retry/timeout
+        def _query_ollama():
+             return client.generate(
+                model=model,
+                prompt=full_prompt,
+                options={
+                    "num_ctx": context_size
+                }
+            )
+
+        # Apply the retry_on_timeout decorator dynamically
+        retried_query = retry_on_timeout(max_retries=3, timeout_seconds=timeout_seconds)(_query_ollama)
+
+        # Run the decorated query
+        response = retried_query()
+
         return response, full_prompt, estimated_tokens
     except ConnectionError as e:
         logging.error(f"Failed to connect to Ollama server: {str(e)}")
@@ -140,7 +154,7 @@ def calculate_tokens_per_second(response: GenerateResponse) -> float:
     tokens_per_second = eval_count / (eval_duration * 1e-9)
     return tokens_per_second
 
-def test_context_size(model: str, context_size: int, num_tests: int = 3) -> tuple[float, float, float]:
+def test_context_size(model: str, context_size: int, conn: sqlite3.Connection, cursor: sqlite3.Cursor, num_tests: int = 3, timeout_seconds: int = 300) -> tuple[float, float, float]:
     """Run multiple tests at a specific context size and return the average tokens/sec and VRAM info."""
     tokens_per_second_list = []
 
@@ -153,7 +167,7 @@ def test_context_size(model: str, context_size: int, num_tests: int = 3) -> tupl
 
     for i in range(num_tests):
         try:
-            response, prompt, estimated_tokens = run_ollama_query(model, context_size)
+            response, prompt, estimated_tokens = run_ollama_query(model, context_size, timeout_seconds)
             tokens_per_second = calculate_tokens_per_second(response)
             tokens_per_second_list.append(tokens_per_second)
 
@@ -188,6 +202,16 @@ def test_context_size(model: str, context_size: int, num_tests: int = 3) -> tupl
             logging.error(f"Error in test {i + 1}: {str(e)}")
             continue
 
+        # Save "zwischen result" to database
+        try:
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute("INSERT INTO results VALUES (?, ?, ?, ?)",
+                           (current_time, context_size, tokens_per_second, model))
+            conn.commit()
+            logging.info(f"Saved intermediate result for context size {context_size} to database.")
+        except Exception as db_e:
+            logging.error(f"Failed to save intermediate result to database: {db_e}")
+
     if tokens_per_second_list:
         avg_tokens_per_second = statistics.mean(tokens_per_second_list)
         logging.info(f"Average tokens/sec for context size {context_size}: {avg_tokens_per_second:.2f}")
@@ -197,8 +221,8 @@ def test_context_size(model: str, context_size: int, num_tests: int = 3) -> tupl
         return 0.0, current_vram, max_vram
 
 
-def find_max_context(model: str, start_size: int = 1024, step_size: int = 1024,
-                     minimum_token_rate: int = 10, num_tests: int = 3) -> Tuple[int, float]:
+def find_max_context(model: str, conn: sqlite3.Connection, cursor: sqlite3.Cursor, start_size: int = 1024, step_size: int = 1024,
+                     minimum_token_rate: int = 10, num_tests: int = 3, timeout_seconds: int = 300) -> Tuple[int, float]:
     """Find the maximum context size for a model that maintains acceptable performance."""
     context_size = start_size
     previous_context_size = start_size
@@ -215,7 +239,7 @@ def find_max_context(model: str, start_size: int = 1024, step_size: int = 1024,
     while True:
         try:
             logging.info(f"\nTesting context size: {context_size}")
-            avg_tokens_per_second, current_vram, max_vram = test_context_size(model, context_size, num_tests)
+            avg_tokens_per_second, current_vram, max_vram = test_context_size(model, context_size, conn, cursor, num_tests, timeout_seconds)
             vram_percent = (current_vram / max_vram * 100) if max_vram > 0 else 0
 
             # Check both token rate and VRAM usage
@@ -245,7 +269,7 @@ def find_max_context(model: str, start_size: int = 1024, step_size: int = 1024,
 
 
 def run_context_test(model: str, min_token_rate: int = 10, start: int = 1024,
-                     step: int = 1024, tests: int = 3) -> None:
+                     step: int = 1024, tests: int = 3, timeout_seconds: int = 300) -> None:
     """
     Run the context size test with the given parameters and log results.
 
@@ -260,9 +284,28 @@ def run_context_test(model: str, min_token_rate: int = 10, start: int = 1024,
     log_filename = setup_logging(model)
     logging.info(f"Log file created: {log_filename}")
 
+    # Database setup
+    db_path = 'results.db'
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS results (
+            date TEXT,
+            context_window_size INTEGER,
+            token_rate REAL,
+            model_name TEXT
+        )
+    ''')
+    conn.commit()
+    logging.info(f"Database '{db_path}' and table 'results' ensured.")
+
     max_context, final_tokens_per_second = find_max_context(
-        model, start, step, min_token_rate, tests
+        model, conn, cursor, start, step, min_token_rate, tests, timeout_seconds
     )
+    # Pass conn and cursor to find_max_context so it can pass them to test_context_size
+    # This requires modifying find_max_context signature and calls as well.
+    # Let's modify find_max_context first.
+    # This diff will be split into two parts.
 
     # Log final results
     logging.info("\n" + "=" * 60)
@@ -271,6 +314,19 @@ def run_context_test(model: str, min_token_rate: int = 10, start: int = 1024,
     logging.info(f"Average tokens per second at max context: {final_tokens_per_second:.2f}")
     logging.info(f"Minimum token rate threshold: {min_token_rate}")
     logging.info("=" * 60)
+
+    # Save "final result" to database
+    try:
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("INSERT INTO results VALUES (?, ?, ?, ?)",
+                       (current_time, max_context, final_tokens_per_second, model))
+        conn.commit()
+        logging.info(f"Saved final result to database.")
+    except Exception as db_e:
+        logging.error(f"Failed to save final result to database: {db_e}")
+    finally:
+        conn.close()
+        logging.info("Database connection closed.")
 
     # Also print to console
     print(f"\nResults have been saved to: {log_filename}")
@@ -284,6 +340,8 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=int, default=1024, help="Starting context size")
     parser.add_argument("--step", type=int, default=1024, help="Step size for context increments")
     parser.add_argument("--tests", type=int, default=3, help="Number of tests per context size")
+    parser.add_argument("--timeout_seconds", type=int, default=300,
+                        help="Timeout in seconds for each Ollama query attempt (default: 300)")
 
     args = parser.parse_args()
     run_context_test(**vars(args))
